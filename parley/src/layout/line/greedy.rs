@@ -458,7 +458,8 @@ impl<'a, B: Brush> BreakLines<'a, B> {
         }
         let mut y: f64 = 0.; // f32 causes test failures due to accumulated error
         let mut prev_line_metrics = None;
-        for line in &mut self.lines.lines {
+        let line_count = self.lines.lines.len();
+        for (line_index, line) in self.lines.lines.iter_mut().enumerate() {
             // Reset metrics for line
             line.metrics.ascent = 0.;
             line.metrics.descent = 0.;
@@ -471,6 +472,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
             }
             // Compute metrics for the line, but ignore trailing whitespace.
             let mut have_metrics = false;
+            let mut extent = TextExtent::default();
             let mut needs_reorder = false;
             for line_item in self.lines.line_items[line.item_range.clone()]
                 .iter_mut()
@@ -486,6 +488,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         // This is equivalent to the entire height of the box being "ascent"
                         line.metrics.ascent = line.metrics.ascent.max(item.height);
                         line.metrics.line_height = line.metrics.line_height.max(item.height);
+                        extent.box_height = extent.box_height.max(item.height);
 
                         // Mark us as having seen non-whitespace content on this line
                         have_metrics = true;
@@ -506,6 +509,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         let run = &self.layout.data.runs[line_item.index];
                         let line_height = line_item.compute_line_height(&self.layout.data);
                         line.metrics.line_height = line.metrics.line_height.max(line_height);
+                        extent.line_height = extent.line_height.max(line_height);
 
                         // Compute the run's advance by summing the advances of its constituent clusters
                         line_item.advance = self.layout.data.clusters
@@ -523,6 +527,8 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         // Compute the run's vertical metrics
                         line.metrics.ascent = line.metrics.ascent.max(run.metrics.ascent);
                         line.metrics.descent = line.metrics.descent.max(run.metrics.descent);
+                        extent.ascent = extent.ascent.max(run.metrics.ascent);
+                        extent.line_gap = extent.line_gap.max(run.metrics.leading);
 
                         // Mark us as having seen non-whitespace content on this line
                         have_metrics = true;
@@ -566,12 +572,15 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         let run = &self.layout.data.runs[line_item.index];
                         line.metrics.ascent = run.metrics.ascent;
                         line.metrics.descent = run.metrics.descent;
+                        extent.ascent = run.metrics.ascent;
+                        extent.line_gap = run.metrics.leading;
                     }
-                } else if let Some(metrics) = prev_line_metrics {
+                } else if let Some((metrics, prev_extent)) = prev_line_metrics {
                     // HACK: copy metrics from previous line if we don't have
                     // any; this should only occur for an empty line following
                     // a newline at the end of a layout
                     line.metrics = metrics;
+                    extent = prev_extent;
                     // If we have no items on this line, it must be the last (empty)
                     // line in a layout following a newline. Commit an empty run so
                     // that AccessKit has a node with which to identify the visual
@@ -638,9 +647,32 @@ impl<'a, B: Brush> BreakLines<'a, B> {
             line.metrics.min_coord = line.metrics.baseline - ascent - leading_above.max(0.);
             line.metrics.max_coord = line.metrics.baseline + descent + leading_below.max(0.);
 
+            if extent.sets_line_box() {
+                // The line height rounded to a whole pixel. Every line steps this plus one
+                // pixel, a constant pitch with no remainder carried from line to line; the
+                // pixel lies between lines, so the last line does not take it.
+                let rounded = round_half_even(extent.line_height);
+                line.metrics.line_height = if line_index + 1 == line_count {
+                    rounded
+                } else {
+                    rounded + 1.
+                };
+                line.metrics.leading =
+                    line.metrics.line_height - (line.metrics.ascent + line.metrics.descent);
+                // Half the leading goes above the line: the rounded height less the font's
+                // own line height (ascent, descent and line gap) rounded up to a whole pixel.
+                let font_height =
+                    (line.metrics.ascent + line.metrics.descent + extent.line_gap).ceil();
+                let top = if quantize { y.round() as f32 } else { y as f32 };
+                line.metrics.baseline = top + line.metrics.ascent + (rounded - font_height) * 0.5;
+                line.metrics.min_coord = top.min(line.metrics.baseline - line.metrics.ascent);
+                line.metrics.max_coord =
+                    (top + rounded).max(line.metrics.baseline + line.metrics.descent);
+            }
+
             y += line.metrics.line_height as f64;
 
-            prev_line_metrics = Some(line.metrics);
+            prev_line_metrics = Some((line.metrics, extent));
         }
         if self.layout.data.text_len == 0 {
             if let Some(line) = self.lines.line_items.first_mut() {
@@ -648,6 +680,38 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                 line.cluster_range = 0..0;
             }
         }
+    }
+}
+
+/// The vertical extent a line's text asks for, apart from its inline boxes.
+#[derive(Clone, Copy, Default)]
+struct TextExtent {
+    /// The largest ascent of the line's text runs.
+    ascent: f32,
+    /// The largest line height of the line's text runs.
+    line_height: f32,
+    /// The largest line gap of the fonts of the line's text runs.
+    line_gap: f32,
+    /// The height of the line's tallest inline box.
+    box_height: f32,
+}
+
+impl TextExtent {
+    /// Whether the text sets the line box: the line has text with a line height, and no
+    /// inline box is taller than the text's ascent or its line height. Otherwise the
+    /// box sets the line box, and the line keeps the box's height and leading split.
+    fn sets_line_box(&self) -> bool {
+        self.line_height > 0. && self.box_height <= self.ascent.min(self.line_height)
+    }
+}
+
+/// Rounds to the nearest whole number, and a half to the even one.
+fn round_half_even(value: f32) -> f32 {
+    let rounded = value.round();
+    if (rounded - value).abs() == 0.5 && rounded % 2. != 0. {
+        rounded - (rounded - value) * 2.
+    } else {
+        rounded
     }
 }
 

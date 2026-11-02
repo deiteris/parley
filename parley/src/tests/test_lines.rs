@@ -3,12 +3,14 @@
 
 //! Test line layouts, including the vertical size and positioning of the line box.
 
+use std::borrow::Cow;
+
 use peniko::kurbo::Size;
 
 use super::utils::{ColorBrush, TestEnv};
 use crate::{
-    Affinity, BoundingBox, Brush, Cursor, InlineBox, Layout, LineHeight, Selection, StyleProperty,
-    test_name,
+    Affinity, BoundingBox, Brush, Cursor, FontFamily, FontStack, InlineBox, Layout, LineHeight,
+    Selection, StyleProperty, test_name,
 };
 
 const TEXT: &str = "Some text here. Let's make\n\
@@ -595,4 +597,132 @@ fn lines_line_height_absolute() {
         crate::AlignmentOptions::default(),
     );
     env.check_layout_snapshot(&layout);
+}
+
+const FIVE_LINES: &str = "one\ntwo\nthree\nfour\nfive";
+
+/// Returns an unwrapped Arimo layout with an absolute line height.
+fn arimo_layout(
+    env: &mut TestEnv,
+    text: &str,
+    font_size: f32,
+    line_height: f32,
+) -> Layout<ColorBrush> {
+    let mut builder = env.ranged_builder(text);
+    builder.push_default(StyleProperty::FontStack(FontStack::Single(
+        FontFamily::Named(Cow::Borrowed("Arimo")),
+    )));
+    builder.push_default(StyleProperty::FontSize(font_size));
+    builder.push_default(LineHeight::Absolute(line_height));
+    let mut layout = builder.build(text);
+    layout.break_all_lines(None);
+    layout
+}
+
+/// Returns the baselines of the layout's lines.
+fn baselines(layout: &Layout<ColorBrush>) -> Vec<f32> {
+    layout.lines().map(|line| line.metrics().baseline).collect()
+}
+
+/// A line height that is not a whole pixel count steps a constant pitch: the height
+/// rounded to a whole pixel, plus one pixel. No remainder carries from line to line.
+#[test]
+fn lines_fractional_line_height_steps_a_constant_rounded_pitch() {
+    let mut env = TestEnv::new(test_name!(), None);
+    // 17.33 px rounds to 17, so every line steps 18 px.
+    let layout = arimo_layout(&mut env, FIVE_LINES, 40. / 3., 52. / 3.);
+
+    let pitches: Vec<f32> = baselines(&layout).windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(pitches, [18.; 4], "expected a constant pitch of 18 px");
+}
+
+/// A whole pixel line height also gains the one pixel between lines.
+#[test]
+fn lines_integral_line_height_steps_one_pixel_more() {
+    let mut env = TestEnv::new(test_name!(), None);
+    let layout = arimo_layout(&mut env, FIVE_LINES, 40. / 3., 17.);
+
+    let pitches: Vec<f32> = baselines(&layout).windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(pitches, [18.; 4], "expected a constant pitch of 18 px");
+}
+
+/// A half pixel line height rounds to even before the pitch pixel is added.
+#[test]
+fn lines_half_pixel_line_height_rounds_to_even() {
+    let mut env = TestEnv::new(test_name!(), None);
+    let layout = arimo_layout(&mut env, FIVE_LINES, 40. / 3., 14.5);
+
+    let pitches: Vec<f32> = baselines(&layout).windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(
+        pitches, [15.; 4],
+        "expected 14.5 px to round to 14, a pitch of 15 px"
+    );
+}
+
+/// The pixel between lines is not added after the last line:
+/// a block of n lines is n times the rounded height plus n - 1 pixels.
+#[test]
+fn lines_block_height_has_no_pitch_pixel_after_the_last_line() {
+    let mut env = TestEnv::new(test_name!(), None);
+    let layout = arimo_layout(&mut env, FIVE_LINES, 40. / 3., 52. / 3.);
+
+    assert_eq!(layout.height(), 5. * 17. + 4., "expected 89 px");
+    let last = layout.lines().last().unwrap();
+    assert_eq!(
+        last.metrics().line_height,
+        17.,
+        "expected the last line to be 17 px"
+    );
+}
+
+/// The first baseline lies the ascent plus half the leading below the top, where the
+/// leading is taken on the rounded line height, against the font's ascent, descent and
+/// line gap rounded up to a whole pixel. The pitch pixel lies wholly below the line.
+#[test]
+fn lines_first_baseline_takes_the_half_leading_of_the_rounded_height() {
+    let mut env = TestEnv::new(test_name!(), None);
+    let layout = arimo_layout(&mut env, FIVE_LINES, 40. / 3., 52. / 3.);
+
+    let line = layout.lines().next().unwrap();
+    let run_metrics = *line.runs().next().unwrap().metrics();
+    assert!(
+        run_metrics.leading > 0.,
+        "expected Arimo to have a line gap"
+    );
+    let normal_height = (run_metrics.ascent + run_metrics.descent + run_metrics.leading).ceil();
+    let expected = run_metrics.ascent + (17. - normal_height) / 2.;
+    assert_eq!(line.metrics().baseline, expected);
+}
+
+/// A line whose height an inline box sets keeps the box's height,
+/// and the text line after it steps from its bottom.
+#[test]
+fn lines_inline_box_line_keeps_its_height() {
+    let mut env = TestEnv::new(test_name!(), None);
+    let text = "box\ntext";
+    let mut builder = env.ranged_builder(text);
+    builder.push_default(StyleProperty::FontStack(FontStack::Single(
+        FontFamily::Named(Cow::Borrowed("Arimo")),
+    )));
+    builder.push_default(StyleProperty::FontSize(40. / 3.));
+    builder.push_default(LineHeight::Absolute(52. / 3.));
+    builder.push_inline_box(InlineBox {
+        id: 0,
+        index: 0,
+        width: 40.0,
+        height: 40.0,
+    });
+    let mut layout = builder.build(text);
+    layout.break_all_lines(None);
+
+    let heights: Vec<f32> = layout
+        .lines()
+        .map(|line| line.metrics().line_height)
+        .collect();
+    assert_eq!(
+        heights,
+        [40., 17.],
+        "expected the box line 40 px, the text line 17 px"
+    );
+    assert_eq!(layout.height(), 57., "expected 40 + 17 px");
 }

@@ -1,7 +1,7 @@
 // Copyright 2026 the Parley Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! The advance of a space.
+//! The advance of a space, and pair kerning.
 
 use std::borrow::Cow;
 
@@ -56,4 +56,20 @@ fn spacing_word_spacing_adds_to_the_i_advance() {
     let advances = cluster_advances(&mut env, "xx xx", 5.);
 
     assert_eq!(advances[2], i + 5., "expected `i` plus the word spacing");
+}
+
+/// No pair is kerned: `AV` advances as `A` and `V` each alone.
+#[test]
+fn spacing_no_pair_is_kerned() {
+    let mut env = TestEnv::new(test_name!(), None);
+    let a = cluster_advances(&mut env, "A", 0.)[0];
+    let v = cluster_advances(&mut env, "V", 0.)[0];
+
+    let advances = cluster_advances(&mut env, "AV", 0.);
+
+    assert_eq!(
+        advances,
+        [a, v],
+        "expected the advances of `A` and `V` alone"
+    );
 }

@@ -320,6 +320,10 @@ fn shape_item<'a, B: Brush>(
             .locale
             .and_then(|lang| lang.language().parse::<harfrust::Language>().ok());
         scx.features.clear();
+        // No pair kerning, as in print typesetting that sets each glyph at its own
+        // advance; the style's features come after, so a style's `kern` still wins.
+        scx.features
+            .push(harfrust::Feature::new(harfrust::Tag::new(b"kern"), 0, ..));
         for feature in rcx.features(item.features).unwrap_or(&[]) {
             scx.features.push(harfrust::Feature::new(
                 harfrust::Tag::from_u32(feature.tag),

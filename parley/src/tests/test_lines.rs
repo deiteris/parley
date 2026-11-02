@@ -40,15 +40,44 @@ fn roboto_ascent_descent(font_size: f32) -> (f32, f32) {
     (ascent / 16. * font_size, descent / 16. * font_size)
 }
 
-/// Returns the expected outputs for ascent, descent, and line box height.
-fn ascent_descent_box_height(font_size: f32, line_height_px: f32) -> (f32, f32, f32) {
+/// The expected vertical metrics of every line of a layout.
+struct Expected {
+    ascent: f32,
+    descent: f32,
+    /// The line height rounded to a whole pixel.
+    rounded: f32,
+    /// The font's own line height rounded up to a whole pixel.
+    font_height: f32,
+}
+
+impl Expected {
+    /// The baseline's offset below the top of its line: the ascent plus half the leading
+    /// of the rounded line height against the font's own.
+    fn baseline_offset(&self) -> f32 {
+        self.ascent + (self.rounded - self.font_height) * 0.5
+    }
+
+    /// The distance from one line's top to the next.
+    fn pitch(&self) -> f32 {
+        self.rounded + 1.
+    }
+
+    /// The height of the layout: one pixel between lines, none after the last.
+    fn layout_height(&self) -> f32 {
+        LINE_COUNT * self.rounded + (LINE_COUNT - 1.)
+    }
+}
+
+/// Returns the expected metrics of a Roboto layout.
+fn expected_metrics(font_size: f32, line_height_px: f32) -> Expected {
     let (ascent, descent) = roboto_ascent_descent(font_size);
-    // Ascent and descent must be rounded separately to match the line box height of Chrome.
-    // See lines_integral_line_height_ascent_descent_rounding() for more details.
-    let ascent_descent = ascent.round() + descent.round();
-    // Line box height does not get reduced by negative leading, so clamp leading to zero.
-    let line_box_height = ascent_descent + (line_height_px.round() - ascent_descent).max(0.);
-    (ascent, descent, line_box_height)
+    Expected {
+        ascent,
+        descent,
+        rounded: line_height_px.round(),
+        // Roboto has no line gap, so its own line height is its ascent and descent.
+        font_height: (ascent + descent).ceil(),
+    }
 }
 
 /// Returns selection geometry such that every line is covered.
@@ -131,9 +160,8 @@ fn compute(
 ) -> (TestEnv, Layout<ColorBrush>, Vec<(BoundingBox, usize)>) {
     // Use max advance as the target width to ensure consistency in case of early line breaks
     let width = max_advance(font_size);
-    // Calculate precise total height based on requested line height,
-    // then round it to match Chrome.
-    let height = (LINE_COUNT * line_height_px).round();
+    // Calculate the total height of the layout's lines.
+    let height = expected_metrics(font_size, line_height_px).layout_height();
     // Compute the layout
     let size = Size::new(width as f64, height as f64);
     let mut env = TestEnv::new(test_name, size);
@@ -143,37 +171,48 @@ fn compute(
 }
 
 /// Assert expectations that are common across tests.
-fn assert_common_truths(
-    layout: &Layout<ColorBrush>,
-    ascent: f32,
-    descent: f32,
-    line_box_height: f32,
-    line_height_px: f32,
-) {
-    let layout_height = LINE_COUNT * line_height_px;
+fn assert_common_truths(layout: &Layout<ColorBrush>, expected: &Expected) {
+    let layout_height = expected.layout_height();
     assert_eq!(
         layout.height(),
         layout_height,
         "expected layout height {layout_height}"
     );
-    for line in layout.lines() {
+    let line_count = layout.lines().count();
+    for (index, line) in layout.lines().enumerate() {
         let metrics = line.metrics();
+        let ascent = expected.ascent;
+        let descent = expected.descent;
         assert_eq!(metrics.ascent, ascent, "expected ascent {ascent}");
         assert_eq!(metrics.descent, descent, "expected descent {descent}");
+        let line_height = if index + 1 == line_count {
+            expected.rounded
+        } else {
+            expected.pitch()
+        };
         assert_eq!(
-            metrics.max_coord - metrics.min_coord,
-            line_box_height,
-            "expected line box height {line_box_height}"
+            metrics.line_height, line_height,
+            "expected line height {line_height}"
         );
+        let top = index as f32 * expected.pitch();
+        let offset = metrics.baseline - top;
+        assert!(
+            (offset - expected.baseline_offset()).abs() < 1e-4,
+            "expected the baseline {} below the line top, got {offset}",
+            expected.baseline_offset()
+        );
+        // The line box holds the rounded line height and every glyph.
+        assert_eq!(metrics.min_coord, top.min(metrics.baseline - ascent));
         assert_eq!(
-            metrics.line_height, line_height_px,
-            "expected line height {line_height_px}"
+            metrics.max_coord,
+            (top + expected.rounded).max(metrics.baseline + descent)
         );
-        assert_eq!(metrics.baseline.fract(), 0., "expected integral baseline");
     }
 }
 
-/// Test the happy path of integral line height with no leading.
+/// Test integral line height equal to the font's line height rounded up.
+///
+/// There is no leading: the baseline sits the ascent below the line top.
 #[test]
 fn lines_integral_line_height_zero_leading() {
     // Inputs
@@ -181,25 +220,24 @@ fn lines_integral_line_height_zero_leading() {
     let line_height_px = 19.0;
 
     // Expected outputs
-    let (ascent, descent, line_box_height) = ascent_descent_box_height(font_size, line_height_px);
+    let expected = expected_metrics(font_size, line_height_px);
+    assert_eq!(
+        expected.rounded, expected.font_height,
+        "expected the font's line height to round up to the line height"
+    );
 
     // Compute
     let (mut env, layout, selections) = compute(test_name!(), font_size, line_height_px);
 
     // Confirm metrics
-    assert_common_truths(&layout, ascent, descent, line_box_height, line_height_px);
-    for line in layout.lines() {
-        let metrics = line.metrics();
-        assert!(
-            ascent.fract() >= 0.5,
-            "expected ascent {ascent} to round up"
+    assert_common_truths(&layout, &expected);
+    for (index, line) in layout.lines().enumerate() {
+        let top = index as f32 * expected.pitch();
+        assert_eq!(
+            line.metrics().baseline - top,
+            expected.ascent,
+            "expected zero leading"
         );
-        assert!(
-            descent.fract() >= 0.5,
-            "expected descent {descent} to round up"
-        );
-        let leading = metrics.leading - (1. - ascent.fract()) - (1. - descent.fract());
-        assert_eq!(leading, 0., "expected zero leading");
     }
 
     // Verify visuals
@@ -208,7 +246,7 @@ fn lines_integral_line_height_zero_leading() {
 
 /// Test integral line height that gives a negative leading of -1.
 ///
-/// The line box height must not be reduced by the negative leading.
+/// The baseline rises half a pixel, and the line box still holds every glyph.
 #[test]
 fn lines_integral_line_height_minus_one_leading() {
     // Inputs
@@ -216,25 +254,24 @@ fn lines_integral_line_height_minus_one_leading() {
     let line_height_px = 19.0;
 
     // Expected outputs
-    let (ascent, descent, line_box_height) = ascent_descent_box_height(font_size, line_height_px);
+    let expected = expected_metrics(font_size, line_height_px);
+    assert_eq!(
+        expected.rounded - expected.font_height,
+        -1.,
+        "expected -1 leading"
+    );
 
     // Compute
     let (mut env, layout, selections) = compute(test_name!(), font_size, line_height_px);
 
     // Confirm metrics
-    assert_common_truths(&layout, ascent, descent, line_box_height, line_height_px);
+    assert_common_truths(&layout, &expected);
     for line in layout.lines() {
         let metrics = line.metrics();
         assert!(
-            ascent.fract() >= 0.5,
-            "expected ascent {ascent} to round up"
+            metrics.max_coord - metrics.min_coord >= expected.ascent + expected.descent,
+            "expected the line box to hold the glyphs"
         );
-        assert!(
-            descent.fract() < 0.5,
-            "expected descent {descent} to round down"
-        );
-        let leading = metrics.leading - (1. - ascent.fract()) + descent.fract();
-        assert_eq!(leading, -1., "expected -1 leading");
     }
 
     // Verify visuals
@@ -243,7 +280,7 @@ fn lines_integral_line_height_minus_one_leading() {
 
 /// Test integral line height that gives a positive leading of 1.
 ///
-/// The line box height must be increased by the leading on the correct side of the baseline.
+/// Half of it lies above the glyphs, and the line box is the line height.
 #[test]
 fn lines_integral_line_height_plus_one_leading() {
     // Inputs
@@ -251,40 +288,30 @@ fn lines_integral_line_height_plus_one_leading() {
     let line_height_px = 19.0;
 
     // Expected outputs
-    let (ascent, descent, line_box_height) = ascent_descent_box_height(font_size, line_height_px);
+    let expected = expected_metrics(font_size, line_height_px);
+    assert_eq!(
+        expected.rounded - expected.font_height,
+        1.,
+        "expected +1 leading"
+    );
 
     // Compute
     let (mut env, layout, selections) = compute(test_name!(), font_size, line_height_px);
 
     // Confirm metrics
-    assert_common_truths(&layout, ascent, descent, line_box_height, line_height_px);
+    assert_common_truths(&layout, &expected);
     for line in layout.lines() {
         let metrics = line.metrics();
-        assert!(
-            ascent.fract() >= 0.5,
-            "expected ascent {ascent} to round up"
-        );
-        assert!(
-            descent.fract() >= 0.5,
-            "expected descent {descent} to round up"
-        );
-        let leading = metrics.leading - (1. - ascent.fract()) - (1. - descent.fract());
-        assert_eq!(leading, 1., "expected +1 leading");
-
-        let above = line.metrics().baseline - line.metrics().min_coord;
+        let above = metrics.baseline - metrics.min_coord;
         assert_eq!(
             above,
-            ascent.round(),
-            "expected above to be exactly rounded ascent {}",
-            ascent.round()
+            expected.ascent + 0.5,
+            "expected above to be the ascent and half a pixel"
         );
-        let below = line.metrics().max_coord - line.metrics().baseline;
         assert_eq!(
-            below,
-            descent.round() + 1.,
-            "expected below to be exactly rounded descent {} + 1. = {}",
-            descent.round(),
-            descent.round() + 1.
+            metrics.max_coord - metrics.min_coord,
+            line_height_px,
+            "expected the line box to be the line height"
         );
     }
 
@@ -292,13 +319,10 @@ fn lines_integral_line_height_plus_one_leading() {
     env.render_and_check_snapshot(&layout, None, &selections);
 }
 
-/// Test that ascent and descent are rounded separately and then summed.
+/// Test that the font's line height is its ascent and descent summed, then rounded up.
 ///
-/// With Roboto 19.0px the ascent and descent are 17.626953 and 4.638672.
-/// When rounding before summing we get 23, when rounding after summing we get 22.
-/// Chrome renders the selection box with a height of 23px.
-///
-/// Roboto 20.0px would be another example with 18.554688 and 4.8828125.
+/// With Roboto 19.0px the ascent and descent are 17.626953 and 4.638672, which sum
+/// to 22.265625: 23 rounded up, where rounding would give 22.
 #[test]
 fn lines_integral_line_height_ascent_descent_rounding() {
     // Inputs
@@ -306,29 +330,31 @@ fn lines_integral_line_height_ascent_descent_rounding() {
     let line_height_px = 20.0; // Just something lower than 23.0 (ascent+descent)
 
     // Expected outputs
-    let (ascent, descent, line_box_height) = ascent_descent_box_height(font_size, line_height_px);
+    let expected = expected_metrics(font_size, line_height_px);
+    assert_eq!(expected.font_height, 23., "expected the sum rounded up");
+    assert_eq!(
+        (expected.ascent + expected.descent).round(),
+        22.,
+        "expected ascent and descent to be such that rounding up matters"
+    );
 
     // Compute
     let (mut env, layout, selections) = compute(test_name!(), font_size, line_height_px);
 
     // Confirm metrics
-    assert_common_truths(&layout, ascent, descent, line_box_height, line_height_px);
-    for line in layout.lines() {
-        let ascent_descent_round_before_sum =
-            line.metrics().ascent.round() + line.metrics().descent.round();
-        let ascent_descent_round_after_sum =
-            (line.metrics().ascent + line.metrics().descent).round();
-        assert_ne!(
-            ascent_descent_round_before_sum, ascent_descent_round_after_sum,
-            "expected ascent and descent to be such that the ordering of round and sum matters"
-        );
-    }
+    assert_common_truths(&layout, &expected);
+    let first = layout.lines().next().unwrap();
+    assert_eq!(
+        first.metrics().baseline,
+        expected.ascent - 1.5,
+        "expected the baseline 1.5 px above the ascent"
+    );
 
     // Verify visuals
     env.render_and_check_snapshot(&layout, None, &selections);
 }
 
-/// Test handling of line height that rounds up both individually and also as the total layout sum.
+/// Test handling of line height that rounds up.
 #[test]
 fn lines_line_height_rounds_up() {
     // Inputs
@@ -336,46 +362,26 @@ fn lines_line_height_rounds_up() {
     let line_height_px = 20.7; // Greater than ascent + descent
 
     // Expected outputs
-    let (ascent, descent, line_box_height) = ascent_descent_box_height(font_size, line_height_px);
+    let expected = expected_metrics(font_size, line_height_px);
+    assert_eq!(expected.rounded, 21., "expected 20.7 to round up");
 
     // Compute
     let (mut env, layout, selections) = compute(test_name!(), font_size, line_height_px);
 
     // Confirm metrics
-    assert_common_truths(&layout, ascent, descent, line_box_height, line_height_px);
-    assert!(
-        layout.height().fract() >= 0.5,
-        "expected layout height to be fractional and round up"
+    assert_common_truths(&layout, &expected);
+    let first = layout.lines().next().unwrap();
+    assert_eq!(
+        first.metrics().line_height,
+        22.,
+        "expected a pitch of the rounded line height and one pixel"
     );
-    for line in layout.lines() {
-        let metrics = line.metrics();
-        assert!(
-            ascent + descent < metrics.line_height,
-            "expected line height {} to be greater than {} (ascent {} + descent {})",
-            metrics.line_height,
-            ascent + descent,
-            ascent,
-            descent,
-        );
-        assert!(
-            metrics.line_height.fract() >= 0.5,
-            "expected line height {} to be fractional and round up",
-            metrics.line_height,
-        );
-        assert_eq!(
-            metrics.line_height.ceil(),
-            line_box_height,
-            "expected line box height {} to equal line height {} rounded up",
-            line_box_height,
-            metrics.line_height,
-        );
-    }
 
     // Verify visuals
     env.render_and_check_snapshot(&layout, None, &selections);
 }
 
-/// Test handling of line height that rounds down both individually and also as the total layout sum.
+/// Test handling of line height that rounds down.
 #[test]
 fn lines_line_height_rounds_down() {
     // Inputs
@@ -383,40 +389,20 @@ fn lines_line_height_rounds_down() {
     let line_height_px = 20.3; // Greater than ascent + descent
 
     // Expected outputs
-    let (ascent, descent, line_box_height) = ascent_descent_box_height(font_size, line_height_px);
+    let expected = expected_metrics(font_size, line_height_px);
+    assert_eq!(expected.rounded, 20., "expected 20.3 to round down");
 
     // Compute
     let (mut env, layout, selections) = compute(test_name!(), font_size, line_height_px);
 
     // Confirm metrics
-    assert_common_truths(&layout, ascent, descent, line_box_height, line_height_px);
-    assert!(
-        layout.height().fract() > 0. && layout.height().fract() < 0.5,
-        "expected layout height to be fractional and round down"
+    assert_common_truths(&layout, &expected);
+    let first = layout.lines().next().unwrap();
+    assert_eq!(
+        first.metrics().line_height,
+        21.,
+        "expected a pitch of the rounded line height and one pixel"
     );
-    for line in layout.lines() {
-        let metrics = line.metrics();
-        assert!(
-            ascent + descent < metrics.line_height,
-            "expected line height {} to be greater than {} (ascent {} + descent {})",
-            metrics.line_height,
-            ascent + descent,
-            ascent,
-            descent,
-        );
-        assert!(
-            metrics.line_height.fract() > 0. && metrics.line_height.fract() < 0.5,
-            "expected line height {} to be fractional and round down",
-            metrics.line_height,
-        );
-        assert_eq!(
-            metrics.line_height.floor(),
-            line_box_height,
-            "expected line box height {} to equal line height {} rounded down",
-            line_box_height,
-            metrics.line_height,
-        );
-    }
 
     // Verify visuals
     env.render_and_check_snapshot(&layout, None, &selections);
@@ -424,20 +410,20 @@ fn lines_line_height_rounds_down() {
 
 /// Test fractional line height with a negative leading.
 ///
-/// The line box height must not be reduced by the negative leading.
+/// The line box must not be reduced below the glyphs by the negative leading.
 fn lines_fractional_line_height_negative_leading_internal(
     test_name: &str,
     font_size: f32,
     line_height_px: f32,
 ) {
     // Expected outputs
-    let (ascent, descent, line_box_height) = ascent_descent_box_height(font_size, line_height_px);
+    let expected = expected_metrics(font_size, line_height_px);
 
     // Compute
     let (mut env, layout, selections) = compute(test_name, font_size, line_height_px);
 
     // Confirm metrics
-    assert_common_truths(&layout, ascent, descent, line_box_height, line_height_px);
+    assert_common_truths(&layout, &expected);
     for line in layout.lines() {
         let metrics = line.metrics();
         assert!(
@@ -445,6 +431,10 @@ fn lines_fractional_line_height_negative_leading_internal(
             "expected negative leading, but got {}",
             metrics.leading
         );
+        assert!(
+            metrics.max_coord - metrics.min_coord >= expected.ascent + expected.descent,
+            "expected the line box to hold the glyphs"
+        );
     }
 
     // Verify visuals
@@ -453,7 +443,7 @@ fn lines_fractional_line_height_negative_leading_internal(
 
 /// Test fractional line height with a negative leading.
 ///
-/// The line box height must not be reduced by the negative leading.
+/// The line box must not be reduced below the glyphs by the negative leading.
 #[test]
 fn lines_fractional_line_height_negative_leading() {
     // Inputs
@@ -466,9 +456,7 @@ fn lines_fractional_line_height_negative_leading() {
 
 /// Test fractional line height with a big negative leading.
 ///
-/// The line box height must not be reduced by the negative leading.
-///
-/// NOTE: Going even lower (than the 0.675em in this test) will start divergence from Chrome.
+/// The line box must not be reduced below the glyphs by the negative leading.
 #[test]
 fn lines_fractional_line_height_big_negative_leading() {
     // Inputs
@@ -481,21 +469,21 @@ fn lines_fractional_line_height_big_negative_leading() {
 
 /// Test fractional line height with a positive leading.
 ///
-/// The line box height must be increased by the leading,
-/// divided correctly between the sides of the baseline.
+/// Half the leading of the rounded line height lies above the glyphs; the rest of
+/// the line box, with the rounding of the font's line height, lies below them.
 fn lines_fractional_line_height_positive_leading_internal(
     test_name: &str,
     font_size: f32,
     line_height_px: f32,
 ) {
     // Expected outputs
-    let (ascent, descent, line_box_height) = ascent_descent_box_height(font_size, line_height_px);
+    let expected = expected_metrics(font_size, line_height_px);
 
     // Compute
     let (mut env, layout, selections) = compute(test_name, font_size, line_height_px);
 
     // Confirm metrics
-    assert_common_truths(&layout, ascent, descent, line_box_height, line_height_px);
+    assert_common_truths(&layout, &expected);
     for line in layout.lines() {
         let metrics = line.metrics();
         assert!(
@@ -504,13 +492,16 @@ fn lines_fractional_line_height_positive_leading_internal(
             metrics.leading
         );
 
-        let above = metrics.baseline - metrics.min_coord;
-        let below = metrics.max_coord - metrics.baseline;
-        let above_leading = above - ascent.round();
-        let below_leading = below - descent.round();
+        let above_leading = metrics.baseline - metrics.min_coord - expected.ascent;
+        let below_leading = metrics.max_coord - metrics.baseline - expected.descent;
+        let half_leading = (expected.rounded - expected.font_height) * 0.5;
         assert!(
-            above_leading < below_leading,
-            "expected above leading {above_leading} to be less than below leading {below_leading}"
+            (above_leading - half_leading).abs() < 1e-4,
+            "expected above leading {above_leading} to be half the leading {half_leading}"
+        );
+        assert!(
+            above_leading <= below_leading,
+            "expected above leading {above_leading} to be at most below leading {below_leading}"
         );
     }
 

@@ -377,10 +377,17 @@ impl<B: Brush> LayoutData<B> {
                 index
             });
 
-        let metrics = {
+        let (metrics, space_advance) = {
             let font = &self.fonts[font_index];
             let font_ref = skrifa::FontRef::from_index(font.data.as_ref(), font.index).unwrap();
-            skrifa::metrics::Metrics::new(&font_ref, skrifa::prelude::Size::new(font_size), coords)
+            (
+                skrifa::metrics::Metrics::new(
+                    &font_ref,
+                    skrifa::prelude::Size::new(font_size),
+                    coords,
+                ),
+                space_advance(&font_ref, coords),
+            )
         };
         let units_per_em = metrics.units_per_em as f32;
 
@@ -464,6 +471,13 @@ impl<B: Brush> LayoutData<B> {
             // Reverse clusters into logical order for RTL
             let clusters_len = self.clusters.len();
             self.clusters[cluster_range_start..clusters_len].reverse();
+        }
+        if let Some(space_advance) = space_advance {
+            run.advance += set_space_advance(
+                &mut self.clusters[cluster_range_start..],
+                &mut self.glyphs[run.glyph_start..],
+                space_advance * scale_factor,
+            );
         }
 
         run.cluster_range = cluster_range_start..self.clusters.len();
@@ -566,6 +580,50 @@ impl<B: Brush> LayoutData<B> {
             max: max_width,
         }
     }
+}
+
+/// Returns the advance of the font's `i` in font units, which every space of a run takes:
+/// the tighter word space of print typesetting, where most faces draw a wider space
+/// (0.278 em in faces with Arial's metrics, whose `i` is 0.222 em).
+///
+/// The advance is unscaled, so it scales as the shaped glyphs do: `skrifa`'s scaled
+/// advance rounds the scale to 16.16 fixed point.
+///
+/// Returns `None` for a face that maps no `i`, whose spaces keep their own advance.
+fn space_advance(font: &skrifa::FontRef<'_>, coords: &[harfrust::NormalizedCoord]) -> Option<f32> {
+    use skrifa::MetadataProvider;
+    let glyph = font.charmap().map('i')?;
+    font.glyph_metrics(skrifa::prelude::Size::unscaled(), coords)
+        .advance_width(glyph)
+}
+
+/// Sets the advance of each space cluster in `clusters` to `advance`, on its last glyph
+/// too, and returns the change in their total advance.
+///
+/// `glyphs` starts at the run's first glyph. Word and letter spacing are added later,
+/// in [`LayoutData::finish`].
+fn set_space_advance(clusters: &mut [ClusterData], glyphs: &mut [Glyph], advance: f32) -> f32 {
+    let mut change = 0.;
+    for cluster in clusters {
+        if cluster.info.whitespace() != Whitespace::Space
+            || cluster.glyph_len == 0
+            || cluster.is_ligature_start()
+            || cluster.is_ligature_component()
+        {
+            continue;
+        }
+        let delta = advance - cluster.advance;
+        cluster.advance = advance;
+        if cluster.glyph_len != 0xFF {
+            let start = cluster.glyph_offset as usize;
+            let end = start + cluster.glyph_len as usize;
+            if let Some(last) = glyphs[start..end].last_mut() {
+                last.advance += delta;
+            }
+        }
+        change += delta;
+    }
+    change
 }
 
 /// Processes shaped glyphs from `HarfRust` and converts them into `ClusterData` and `Glyph`.

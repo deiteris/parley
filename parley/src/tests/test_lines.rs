@@ -717,3 +717,33 @@ fn lines_inline_box_line_keeps_its_height() {
     );
     assert_eq!(layout.height(), 57., "expected 40 + 17 px");
 }
+
+/// A line whose inline box is no taller than the text's ascent keeps the text's pitch.
+#[test]
+fn lines_inline_box_as_tall_as_the_ascent_keeps_the_pitch() {
+    let mut env = TestEnv::new(test_name!(), None);
+    let ascent = arimo_layout(&mut env, FIVE_LINES, 40. / 3., 52. / 3.)
+        .lines()
+        .next()
+        .unwrap()
+        .metrics()
+        .ascent;
+    let mut builder = env.ranged_builder(FIVE_LINES);
+    builder.push_default(StyleProperty::FontStack(FontStack::Single(
+        FontFamily::Named(Cow::Borrowed("Arimo")),
+    )));
+    builder.push_default(StyleProperty::FontSize(40. / 3.));
+    builder.push_default(LineHeight::Absolute(52. / 3.));
+    builder.push_inline_box(InlineBox {
+        id: 0,
+        index: 0,
+        width: 10.0,
+        height: ascent,
+    });
+    let mut layout = builder.build(FIVE_LINES);
+    layout.break_all_lines(None);
+
+    let pitches: Vec<f32> = baselines(&layout).windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(pitches, [18.; 4], "expected the box line to step 18 px too");
+    assert_eq!(layout.height(), 5. * 17. + 4., "expected 89 px");
+}
